@@ -1,80 +1,122 @@
-/**
- * Talk Me Out Of It — Cloud Functions backend
- * -------------------------------------------
- * Two features live here:
- *   1. Stripe (stripeWebhook — Payment Links handle checkout itself now,
- *      this function just confirms payment and upgrades the user)
- *   2. Push notifications (registerFcmToken + sendDailyReminders)
- *
- * SETUP — run these once from your project root before deploying:
- *
- *   cd functions
- *   npm install stripe firebase-admin firebase-functions
- *
- *   firebase functions:secrets:set STRIPE_SECRET_KEY
- *   firebase functions:secrets:set STRIPE_WEBHOOK_SECRET
- *
- * Then deploy:
- *   firebase deploy --only functions
- */
- 
-const functions = require("firebase-functions");
+const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { onRequest } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 admin.initializeApp();
- 
+
 const db = admin.firestore();
- 
+const messaging = admin.messaging();
+
 // ---------------------------------------------------------------
-// STRIPE SETUP
+// REMINDERS (Gen 2 scheduled functions)
 // ---------------------------------------------------------------
-// Reads secrets set via `firebase functions:secrets:set` (Secret
-// Manager) — exposed as environment variables at runtime. Every
-// exported function below that needs Stripe declares
-// .runWith({ secrets: [...] }) so these are actually populated.
-function stripeSecretKey() {
-  return process.env.STRIPE_SECRET_KEY;
-}
-function stripeWebhookSecret() {
-  return process.env.STRIPE_WEBHOOK_SECRET;
-}
- 
+exports.sendReminders = onSchedule("every day 10:00", async (event) => {
+  const usersSnap = await db.collection("users").get();
+  const now = Date.now();
+  const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+  const sends = [];
+
+  usersSnap.forEach((doc) => {
+    const user = doc.data();
+    if (!user.fcmToken) return;
+
+    const prefs = user.notificationPrefs || {};
+    const lastActive = user.lastActiveAt ? user.lastActiveAt.toMillis() : 0;
+    const inactiveTooLong = (now - lastActive) > sevenDaysMs;
+
+    if (prefs.inactivityReminders && inactiveTooLong) {
+      sends.push(messaging.send({
+        token: user.fcmToken,
+        notification: {
+          title: "Talk Me Out Of It",
+          body: "Haven't seen you in a while â€” check in on your goals!",
+        },
+      }).catch((err) => console.error("Send failed for", doc.id, err)));
+    }
+  });
+
+  await Promise.all(sends);
+  console.log(`Checked ${usersSnap.size} users, sent ${sends.length} reminders.`);
+});
+
+exports.sendContributionReminders = onSchedule("every day 10:30", async (event) => {
+  const usersSnap = await db.collection("users").get();
+  const now = Date.now();
+  const threeDaysMs = 3 * 24 * 60 * 60 * 1000;
+
+  const sends = [];
+
+  usersSnap.forEach((doc) => {
+    const user = doc.data();
+    if (!user.fcmToken) return;
+
+    const prefs = user.notificationPrefs || {};
+    if (!prefs.contributionReminders) return;
+
+    const goals = user.goals || [];
+    goals.forEach((goal) => {
+      if (!goal.targetDate) return;
+      if (goal.currentAmount >= goal.targetAmount) return;
+
+      const targetMs = goal.targetDate.toMillis ? goal.targetDate.toMillis() : new Date(goal.targetDate).getTime();
+      const msUntilDue = targetMs - now;
+
+      const isComingUpSoon = msUntilDue > 0 && msUntilDue <= threeDaysMs;
+      const isOverdue = msUntilDue < 0;
+
+      if (isComingUpSoon || isOverdue) {
+        const body = isOverdue
+          ? `Your "${goal.name}" goal payment is overdue.`
+          : `Your "${goal.name}" goal payment is coming up soon.`;
+
+        sends.push(messaging.send({
+          token: user.fcmToken,
+          notification: {
+            title: "Talk Me Out Of It",
+            body: body,
+          },
+        }).catch((err) => console.error("Send failed for", doc.id, err)));
+      }
+    });
+  });
+
+  await Promise.all(sends);
+  console.log(`Checked ${usersSnap.size} users, sent ${sends.length} contribution reminders.`);
+});
+
+// ---------------------------------------------------------------
+// STRIPE â€” Payment Links now handle checkout itself (no more
+// createCheckoutSession); this webhook just confirms payment and
+// upgrades the right user. Secrets come from Secret Manager
+// (firebase functions:secrets:set STRIPE_SECRET_KEY /
+// STRIPE_WEBHOOK_SECRET) â€” Gen 2 reads them via defineSecret().
+// ---------------------------------------------------------------
 const Stripe = require("stripe");
- 
-// ---------------------------------------------------------------
-// 1. stripeWebhook — HTTP function, called by Stripe (not your frontend)
-//    You're using Stripe Payment Links now, so checkout itself happens
-//    entirely on Stripe's side — this function just listens for the
-//    payment confirmation and upgrades the right Firebase user.
-//    Register this URL in the Stripe Dashboard → Developers → Webhooks:
-//      https://<region>-<project-id>.cloudfunctions.net/stripeWebhook
-//    Subscribe it to: checkout.session.completed,
-//                      customer.subscription.deleted
-//    Payment Links support ?client_reference_id=<uid> appended to the
-//    URL — that's what lets this function know which user paid.
-// ---------------------------------------------------------------
-exports.stripeWebhook = functions
-  .runWith({ secrets: ["STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET"] })
-  .https.onRequest(async (req, res) => {
-    const stripe = Stripe(stripeSecretKey());
+
+const stripeSecretKeyParam = defineSecret("STRIPE_SECRET_KEY");
+const stripeWebhookSecretParam = defineSecret("STRIPE_WEBHOOK_SECRET");
+
+exports.stripeWebhook = onRequest(
+  { secrets: [stripeSecretKeyParam, stripeWebhookSecretParam] },
+  async (req, res) => {
+    const stripe = Stripe(stripeSecretKeyParam.value());
     const sig = req.headers["stripe-signature"];
- 
+
     let event;
     try {
-      // req.rawBody is required for signature verification — this only
-      // works if this function receives the raw body, which onRequest
-      // gives you automatically (don't add a body-parsing middleware).
-      event = stripe.webhooks.constructEvent(req.rawBody, sig, stripeWebhookSecret());
+      event = stripe.webhooks.constructEvent(req.rawBody, sig, stripeWebhookSecretParam.value());
     } catch (err) {
       console.error("Webhook signature verification failed:", err.message);
       res.status(400).send(`Webhook Error: ${err.message}`);
       return;
     }
- 
+
     try {
       if (event.type === "checkout.session.completed") {
         const session = event.data.object;
         const uid = session.client_reference_id || session.metadata?.uid;
- 
+
         if (uid) {
           await db.collection("users").doc(uid).set(
             {
@@ -86,105 +128,24 @@ exports.stripeWebhook = functions
           );
         }
       }
- 
+
       if (event.type === "customer.subscription.deleted") {
         const subscription = event.data.object;
-        // Find the user by their stored subscription id and downgrade them.
         const snap = await db
           .collection("users")
           .where("stripeSubscriptionId", "==", subscription.id)
           .limit(1)
           .get();
- 
+
         if (!snap.empty) {
           await snap.docs[0].ref.set({ subscription: "free" }, { merge: true });
         }
       }
- 
+
       res.status(200).send("ok");
     } catch (err) {
       console.error("Webhook handling failed:", err);
       res.status(500).send("Internal error");
     }
-  });
- 
-// ---------------------------------------------------------------
-// 2. registerFcmToken — callable function
-//    Not currently used by the client (it writes the token to
-//    Firestore directly), but left here in case that changes later.
-//    Tokens are stored as an array since a person may open the app
-//    on more than one device.
-// ---------------------------------------------------------------
-exports.registerFcmToken = functions.https.onCall(async (data, context) => {
-  if (!context.auth) {
-    throw new functions.https.HttpsError("unauthenticated", "You must be signed in.");
   }
-  const { token } = data;
-  if (!token) {
-    throw new functions.https.HttpsError("invalid-argument", "Missing token.");
-  }
- 
-  const uid = context.auth.uid;
-  await db
-    .collection("users")
-    .doc(uid)
-    .set(
-      { fcmTokens: admin.firestore.FieldValue.arrayUnion(token) },
-      { merge: true }
-    );
- 
-  return { ok: true };
-});
- 
-// ---------------------------------------------------------------
-// 3. sendDailyReminders — scheduled function
-//    Runs once a day, looks at each user's notification prefs, and
-//    sends a push to anyone who's opted in and due for a nudge.
-//    Adjust the schedule string to whatever time makes sense for you.
-// ---------------------------------------------------------------
-exports.sendDailyReminders = functions.pubsub
-  .schedule("every day 09:00")
-  .timeZone("America/Chicago")
-  .onRun(async () => {
-    const usersSnap = await db.collection("users").get();
-    const now = Date.now();
-    const oneWeekMs = 7 * 24 * 60 * 60 * 1000;
- 
-    const sends = [];
- 
-    usersSnap.forEach((doc) => {
-      const profile = doc.data();
-      const tokens = profile.fcmTokens;
-      if (!tokens || tokens.length === 0) return;
- 
-      const prefs = profile.notificationPrefs || {};
-      let title = null;
-      let body = null;
- 
-      // Inactivity reminder — nudge if they haven't logged a purchase in a week.
-      if (prefs.inactivityReminders && profile.lastLoginDate) {
-        const lastLogin = new Date(profile.lastLoginDate).getTime();
-        if (now - lastLogin > oneWeekMs) {
-          title = "Haven't seen you in a while";
-          body = "Log a purchase or check in on your goals in Talk Me Out Of It.";
-        }
-      }
- 
-      // Contribution reminders would need each group goal's due dates
-      // pulled in here too — left as a follow-up since group goals
-      // aren't in Firestore yet (see the comment near firebaseConfig
-      // in Index.html).
- 
-      if (title && body) {
-        sends.push(
-          admin.messaging().sendEachForMulticast({
-            tokens,
-            notification: { title, body },
-          })
-        );
-      }
-    });
- 
-    await Promise.all(sends);
-    return null;
-  });
+);
