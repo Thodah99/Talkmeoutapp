@@ -1,5 +1,6 @@
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onRequest } = require("firebase-functions/v2/https");
+const { onDocumentUpdated } = require("firebase-functions/v2/firestore");
 const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 admin.initializeApp();
@@ -147,5 +148,79 @@ exports.stripeWebhook = onRequest(
       console.error("Webhook handling failed:", err);
       res.status(500).send("Internal error");
     }
+  }
+);
+// ---------------------------------------------------------------
+// GROUP GOAL CONTRIBUTION NOTIFICATIONS (Gen 2 Firestore trigger)
+// ---------------------------------------------------------------
+exports.notifyOnContributionLogged = onDocumentUpdated(
+  "groupGoals/{groupId}",
+  async (event) => {
+    const before = event.data.before.data();
+    const after = event.data.after.data();
+
+    if (!before || !after) return;
+
+    const beforeParticipants = before.participants || [];
+    const afterParticipants = after.participants || [];
+
+    let loggedByName = null;
+    let loggedByUid = null;
+
+    afterParticipants.forEach((afterP, pIndex) => {
+      const beforeP = beforeParticipants[pIndex];
+      if (!beforeP) return;
+
+      const beforeSchedule = beforeP.schedule || [];
+      const afterSchedule = afterP.schedule || [];
+
+      afterSchedule.forEach((afterEntry, sIndex) => {
+        const beforeEntry = beforeSchedule[sIndex];
+        if (!beforeEntry) return;
+
+        const justCompleted = !beforeEntry.completed && afterEntry.completed;
+        if (justCompleted) {
+          loggedByName = afterP.name;
+          loggedByUid = afterP.uid;
+        }
+      });
+    });
+
+    if (!loggedByUid) return;
+
+    const goalName = after.name || "your group goal";
+    const otherUids = (after.memberUids || []).filter((uid) => uid !== loggedByUid);
+
+    if (otherUids.length === 0) return;
+
+    const sends = [];
+
+    for (const uid of otherUids) {
+      const userDoc = await db.collection("users").doc(uid).get();
+      if (!userDoc.exists) continue;
+
+      const user = userDoc.data();
+      if (!user.fcmToken) continue;
+
+      const prefs = user.notificationPrefs || {};
+      if (!prefs.contributionReminders) continue;
+
+      sends.push(
+        messaging
+          .send({
+            token: user.fcmToken,
+            notification: {
+              title: "Talk Me Out Of It",
+              body: `${loggedByName} just logged their contribution to "${goalName}"! 🎉`,
+            },
+          })
+          .catch((err) => console.error("Send failed for", uid, err))
+      );
+    }
+
+    await Promise.all(sends);
+    console.log(
+      `Group "${goalName}": notified ${sends.length} member(s) that ${loggedByName} logged a contribution.`
+    );
   }
 );
