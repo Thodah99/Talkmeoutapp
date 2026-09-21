@@ -18,6 +18,7 @@ firebase.initializeApp({
 const messaging = firebase.messaging();
 
 messaging.onBackgroundMessage((payload) => {
+if (payload.notification) return; // Firebase already shows these itself
   const { title, body } = payload.notification || {};
   self.registration.showNotification(title || "Talk Me Out Of It", {
     body: body || "",
